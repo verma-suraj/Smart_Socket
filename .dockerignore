@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Source and dev files (we build inside Docker)
+tests/
+*.test.ts
+*.spec.ts
+
+# Build output (rebuilt in Docker)
+dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+service-account.json
+*.pem
+*.key
+
+# Version control
+.git/
+.gitignore
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+
+# Kiro specs
+.kiro/
+
+# Misc
+coverage/
+.nyc_output/
+*.log
+npm-debug.log*

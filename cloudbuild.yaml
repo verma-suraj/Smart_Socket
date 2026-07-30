@@ -1,0 +1,71 @@
+# Google Cloud Build configuration for Smart Socket Backend
+# Deploy to Cloud Run with persistent MQTT connection support
+#
+# Usage:
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions=_SERVICE_NAME=smart-socket-backend,_REGION=us-central1
+
+substitutions:
+  _SERVICE_NAME: smart-socket-backend
+  _REGION: us-central1
+  _MIN_INSTANCES: '1'
+  _MAX_INSTANCES: '10'
+  _MEMORY: 512Mi
+  _TIMEOUT: '3600'
+
+steps:
+  # Step 1: Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+      - '.'
+
+  # Step 2: Push the Docker image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--min-instances'
+      - '${_MIN_INSTANCES}'
+      - '--max-instances'
+      - '${_MAX_INSTANCES}'
+      - '--memory'
+      - '${_MEMORY}'
+      - '--timeout'
+      - '${_TIMEOUT}'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'NODE_ENV=production'
+      - '--port'
+      - '8080'
+
+# Store images in Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+
+# Build timeout (10 minutes)
+timeout: '600s'
