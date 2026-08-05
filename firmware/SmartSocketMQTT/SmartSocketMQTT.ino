@@ -1,15 +1,13 @@
 /*
- * ESP32-S3 Smart Socket Firmware — MQTT Edition v2.0
- * 
+ * ESP32-S3 Smart Socket Firmware — MQTT Edition v3.0
+ *
  * Features:
- *   - MQTT telemetry + heartbeat to HiveMQ Cloud (TLS)
- *   - Relay commands from backend
- *   - RFID scan → backend auth → session start/stop
- *   - LCD state machine: Boot → WiFi → Idle → Session → Summary → Idle
- *   - Sensor health monitoring with LCD warnings
- *   - Temperature safety override at 40°C
- *   - Session timer with NVS persistence
- *   - Node online heartbeat every 10s
+ *   - PZEM-004T energy metering (V, I, P, energy, freq, PF)  [ported from ESP1aLLworking]
+ *   - DS18B20 temperature with 40C safety cutoff (38C hysteresis)
+ *   - MFRC522 RFID -> backend auth over MQTT
+ *   - Single relay (active LOW), NVS-persisted state + accumulated on-time
+ *   - MQTT telemetry (short-key schema v,i,p,f,pf,t,ts) + heartbeat to HiveMQ (TLS)
+ *   - 20x4 I2C LCD state machine (boot -> wifi -> idle -> auth -> live -> summary -> thankyou)
  *
  * Hardware: PZEM-004T, DS18B20, MFRC522, Relay, hd44780 I2C LCD 20x4
  */
@@ -33,8 +31,8 @@
 // ============================================================
 // CONFIGURATION
 // ============================================================
-#define WIFI_SSID         "Om"
-#define WIFI_PASS         "om12345678"
+#define WIFI_SSID         "surajverma"
+#define WIFI_PASS         "987654321"
 
 #define MQTT_HOST         "56ea5e16974f414b87f83e18ff65c823.s1.eu.hivemq.cloud"
 #define MQTT_PORT         8883
@@ -43,7 +41,7 @@
 
 #define NODE_ID           "node-001"
 
-// PIN MAP
+// PIN MAP  (identical to ESP1aLLworking.ino — the known-good wiring)
 #define RELAY_PIN         5
 #define RELAY_ACTIVE_LOW  true
 #define SS_PIN            38
@@ -67,6 +65,11 @@
 #define HEARTBEAT_INTERVAL    10000
 #define SENSOR_READ_INTERVAL  1500
 #define MQTT_RECONNECT_DELAY  5000
+#define AUTH_TIMEOUT_MS       8000
+#define WELCOME_MS            10000
+#define DASHBOARD_MSG_MS      10000
+#define SUMMARY_MS            30000
+#define THANKYOU_MS           5000
 #define NTP_SERVER            "pool.ntp.org"
 #define TIMEZONE              "IST-5:30"
 
@@ -95,14 +98,15 @@ Preferences prefs;
 enum LcdState {
   LCD_BOOT,           // "Welcome to NinetyNine Labs"
   LCD_WIFI_CONNECT,   // "Connecting to WiFi..."
-  LCD_WIFI_STATUS,    // "Connected" or "Offline"
+  LCD_WIFI_RESULT,    // "WiFi Connected" / "WiFi Offline"
   LCD_IDLE,           // "Please tap RFID card"
-  LCD_AUTH_SUCCESS,   // "Welcome <name>" (10s)
-  LCD_AUTH_FAIL,      // "Please open dashboard" (10s)
-  LCD_SESSION_LIVE,   // Live values during session
-  LCD_SESSION_END,    // Summary after session ends (30s)
-  LCD_THANKYOU,       // "Thank you for using 99Labs"
-  LCD_SENSOR_WARN     // Sensor fault warning
+  LCD_AUTHENTICATING, // "Authenticating..." (waiting for backend)
+  LCD_WELCOME,        // "Welcome <name>" (10s) -> LIVE
+  LCD_DASHBOARD_MSG,  // "Please open dashboard" (10s) -> IDLE
+  LCD_LIVE,           // live session values
+  LCD_SUMMARY,        // session summary (30s) -> THANKYOU
+  LCD_THANKYOU,       // "Thank you for using 99Labs" -> IDLE
+  LCD_TEMP_FAULT      // over-temperature warning
 };
 
 LcdState lcdState = LCD_BOOT;
@@ -127,12 +131,13 @@ bool rfidOk = false;
 
 // Session data
 float sessionEnergyStart = 0;
-float sessionEnergyEnd = 0;
 uint32_t sessionStartMs = 0;
-uint32_t sessionDurationSec = 0;
-float sessionBill = 0;
+uint32_t sessionDurationSec = 0;   // this session elapsed (s)
+uint32_t sessionSocketActiveSec = 0; // accumulated relay-on time snapshot (s)
+float sessionEnergyConsumed = 0;   // kWh this session
+float sessionBill = 0;             // tariff this session
 
-// Accumulated timer (persisted)
+// Accumulated relay-on timer (persisted across reboots)
 uint32_t accumulatedSec = 0;
 uint32_t timerStartSec = 0;
 bool timerRunning = false;
@@ -146,7 +151,7 @@ unsigned long lastWifiRetry = 0;
 unsigned long lastLcdRefresh = 0;
 
 // ============================================================
-// LCD HELPER
+// LCD HELPERS
 // ============================================================
 void lcdSetState(LcdState newState) {
   lcdState = newState;
@@ -162,11 +167,17 @@ void lcdPrintCenter(int row, const char* text) {
   lcd.print(text);
 }
 
+String fmtHMS(uint32_t s) {
+  char b[12];
+  snprintf(b, sizeof(b), "%02u:%02u:%02u", s / 3600, (s % 3600) / 60, s % 60);
+  return String(b);
+}
+
 // ============================================================
-// RELAY CONTROL
+// RELAY CONTROL + ACCUMULATED TIMER
 // ============================================================
 void setRelay(bool state) {
-  if (state && tempOverride) return;
+  if (state && tempOverride) return;  // never turn on while over-temp
   relayState = state;
   bool physical = RELAY_ACTIVE_LOW ? !state : state;
   digitalWrite(RELAY_PIN, physical ? HIGH : LOW);
@@ -185,6 +196,7 @@ void setRelay(bool state) {
   prefs.begin("app", false);
   prefs.putBool("relay", state);
   prefs.end();
+  Serial.printf("[RELAY] %s\n", state ? "ON" : "OFF");
 }
 
 uint32_t getTotalTimerSec() {
@@ -201,50 +213,54 @@ void startSession(const char* userName) {
   sessionStartMs = millis();
   sessionUserName = String(userName);
   setRelay(true);
-
-  // Show welcome
-  if (strlen(userName) > 0) {
-    lcdSetState(LCD_AUTH_SUCCESS);
-  } else {
-    lcdSetState(LCD_AUTH_FAIL);
-  }
+  lcdSetState(LCD_WELCOME);
+  Serial.printf("[SESSION] Started user='%s'\n", sessionUserName.c_str());
 }
 
-void endSession() {
+void endSession(const char* reason) {
   sessionActive = false;
   setRelay(false);
-  sessionEnergyEnd = sEnergy;
   sessionDurationSec = (millis() - sessionStartMs) / 1000;
-  float consumed = sessionEnergyEnd - sessionEnergyStart;
-  if (consumed < 0) consumed = 0;
+  sessionSocketActiveSec = getTotalTimerSec();
+  float consumed = sEnergy - sessionEnergyStart;
+  if (consumed < 0 || isnan(consumed)) consumed = 0;
+  sessionEnergyConsumed = consumed;
   sessionBill = consumed * COST_PER_UNIT;
-  lcdSetState(LCD_SESSION_END);
+  lcdSetState(LCD_SUMMARY);
+  Serial.printf("[SESSION] Ended (%s) time=%us energy=%.3fkWh bill=%.2f\n",
+                reason, sessionDurationSec, sessionEnergyConsumed, sessionBill);
 }
 
 // ============================================================
-// MQTT CALLBACK
+// MQTT CALLBACK (backend -> node)
 // ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
 
   String t = String(topic);
-  if (t == T_COMMAND) {
-    const char* cmd = doc["relay_state"];
-    const char* reason = doc["reason"] | "cloud";
+  if (t != T_COMMAND) return;
 
-    if (cmd) {
-      if (strcmp(cmd, "on") == 0 && !sessionActive) {
-        // Backend starting session (e.g., after RFID auth)
-        const char* uname = doc["userName"] | "";
-        startSession(uname);
-      } else if (strcmp(cmd, "off") == 0 && sessionActive) {
-        endSession();
-      } else {
-        // Simple relay toggle without session
-        setRelay(strcmp(cmd, "on") == 0);
-      }
-    }
+  const char* reason = doc["reason"] | "";
+  const char* cmd    = doc["relay_state"];
+  const char* uname  = doc["userName"] | "";
+
+  Serial.printf("[CMD] relay=%s reason=%s user=%s\n", cmd ? cmd : "(none)", reason, uname);
+
+  // Unknown card -> backend tells us to show the dashboard hint
+  if (strcmp(reason, "auth_denied") == 0) {
+    lcdSetState(LCD_DASHBOARD_MSG);
+    return;
+  }
+
+  if (!cmd) return;
+
+  if (strcmp(cmd, "on") == 0) {
+    if (!sessionActive) startSession(uname);   // backend authorised -> start session
+    else setRelay(true);
+  } else if (strcmp(cmd, "off") == 0) {
+    if (sessionActive) endSession(reason[0] ? reason : "dashboard");
+    else setRelay(false);
   }
 }
 
@@ -257,33 +273,41 @@ void connectMqtt() {
   lastMqttRetry = millis();
 
   String clientId = "esp32-" NODE_ID "-" + String(random(1000, 9999));
+  Serial.printf("[MQTT] Connecting to %s:%d user=%s id=%s ... ",
+                MQTT_HOST, MQTT_PORT, MQTT_USER, clientId.c_str());
   if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
+    Serial.println("CONNECTED");
     mqtt.subscribe(T_COMMAND.c_str());
+    Serial.printf("[MQTT] Subscribed to %s\n", T_COMMAND.c_str());
+  } else {
+    Serial.printf("FAILED, state=%d\n", mqtt.state());
   }
 }
 
 // ============================================================
-// PUBLISH TELEMETRY
+// PUBLISH TELEMETRY  (short-key schema expected by backend parser)
 // ============================================================
 void publishTelemetry() {
   if (!mqtt.connected()) return;
 
   JsonDocument doc;
-  doc["v"]  = pzemOk ? round(sVoltage * 10.0) / 10.0 : 0;
-  doc["i"]  = pzemOk ? round(sCurrent * 100.0) / 100.0 : 0;
-  doc["p"]  = pzemOk ? round(sPower * 10.0) / 10.0 : 0;
-  doc["f"]  = pzemOk ? round(sFrequency * 10.0) / 10.0 : 0;
-  doc["pf"] = pzemOk ? round(sPowerFactor * 100.0) / 100.0 : 0;
-  doc["t"]  = ds18b20Ok ? round(sTemperature * 10.0) / 10.0 : 0;
-  doc["ts"] = (unsigned long)millis();
+  doc["v"]  = round(sVoltage * 10.0) / 10.0;
+  doc["i"]  = round(sCurrent * 100.0) / 100.0;
+  doc["p"]  = round(sPower * 10.0) / 10.0;
+  doc["f"]  = round(sFrequency * 10.0) / 10.0;
+  doc["pf"] = round(sPowerFactor * 100.0) / 100.0;
+  doc["t"]  = round(sTemperature * 10.0) / 10.0;
+  time_t nowSec = time(nullptr);
+  doc["ts"] = (nowSec > 100000) ? (unsigned long)nowSec : (unsigned long)(millis() / 1000);
 
   char buf[256];
   serializeJson(doc, buf, sizeof(buf));
-  mqtt.publish(T_TELEMETRY.c_str(), buf);
+  bool ok = mqtt.publish(T_TELEMETRY.c_str(), buf);
+  Serial.printf("[TELEMETRY] %s (%s)\n", buf, ok ? "sent" : "FAILED");
 }
 
 // ============================================================
-// PUBLISH HEARTBEAT (keeps node "online" on dashboard)
+// PUBLISH HEARTBEAT
 // ============================================================
 void publishHeartbeat() {
   if (!mqtt.connected()) return;
@@ -303,13 +327,13 @@ void publishHeartbeat() {
 }
 
 // ============================================================
-// READ SENSORS
+// READ SENSORS  (logic ported from ESP1aLLworking.ino)
 // ============================================================
 void readSensors() {
   if (millis() - lastSensorRead < SENSOR_READ_INTERVAL) return;
   lastSensorRead = millis();
 
-  // DS18B20
+  // DS18B20 temperature
   ds18b20.requestTemperatures();
   float t = ds18b20.getTempCByIndex(0);
   if (t > -100.0 && t < 125.0) {
@@ -319,34 +343,24 @@ void readSensors() {
     ds18b20Ok = false;
   }
 
-  // PZEM-004T
+  // PZEM-004T — keep any successful (non-NaN) reading; NaN = comm failure.
   float v = pzem.voltage();
-  float c = pzem.current();
-  float p = pzem.power();
-  float e = pzem.energy();
-  float f = pzem.frequency();
-  float pf = pzem.pf();
+  if (!isnan(v)) { sVoltage = v; pzemOk = true; } else { pzemOk = false; }
+  float c = pzem.current();   if (!isnan(c)) sCurrent = c;
+  float p = pzem.power();     if (!isnan(p)) sPower = p;
+  float e = pzem.energy();    if (!isnan(e)) sEnergy = e;
+  float f = pzem.frequency(); if (!isnan(f)) sFrequency = f;
+  float pf = pzem.pf();       if (!isnan(pf)) sPowerFactor = pf;
 
-  // If voltage reads valid, PZEM is working
-  if (!isnan(v) && v > 0) {
-    pzemOk = true;
-    sVoltage = v;
-    if (!isnan(c)) sCurrent = c;
-    if (!isnan(p)) sPower = p;
-    if (!isnan(e)) sEnergy = e;
-    if (!isnan(f)) sFrequency = f;
-    if (!isnan(pf)) sPowerFactor = pf;
-  } else {
-    pzemOk = false;
-  }
-
-  // Temperature safety
+  // Temperature safety override (highest precedence)
   if (ds18b20Ok && sTemperature >= TEMP_LIMIT && !tempOverride) {
     tempOverride = true;
-    if (sessionActive) endSession();
+    if (sessionActive) endSession("safety");
     else setRelay(false);
+    lcdSetState(LCD_TEMP_FAULT);
   } else if (tempOverride && ds18b20Ok && sTemperature < (TEMP_LIMIT - TEMP_HYSTERESIS)) {
     tempOverride = false;
+    if (lcdState == LCD_TEMP_FAULT) lcdSetState(LCD_IDLE);
   }
 }
 
@@ -355,6 +369,17 @@ void readSensors() {
 // ============================================================
 byte lastUID[4] = {0};
 unsigned long lastRfidTime = 0;
+
+void publishRfid(const char* uid) {
+  if (!mqtt.connected()) return;
+  JsonDocument doc;
+  doc["uid"] = uid;
+  doc["timestamp"] = (unsigned long)millis();
+  char buf[128];
+  serializeJson(doc, buf, sizeof(buf));
+  mqtt.publish(T_RFID.c_str(), buf);
+  Serial.printf("[RFID] Published UID %s\n", uid);
+}
 
 void handleRfid() {
   if (!rfidOk) return;
@@ -371,27 +396,18 @@ void handleRfid() {
     return;
   }
 
-  // If session is active, RFID tap ends the session
-  if (sessionActive) {
-    endSession();
-  } else {
-    // Publish RFID to backend for authentication
-    char uid[12];
-    snprintf(uid, sizeof(uid), "%02X%02X%02X%02X",
-             rfidReader.uid.uidByte[0], rfidReader.uid.uidByte[1],
-             rfidReader.uid.uidByte[2], rfidReader.uid.uidByte[3]);
+  char uid[12];
+  snprintf(uid, sizeof(uid), "%02X%02X%02X%02X",
+           rfidReader.uid.uidByte[0], rfidReader.uid.uidByte[1],
+           rfidReader.uid.uidByte[2], rfidReader.uid.uidByte[3]);
 
-    if (mqtt.connected()) {
-      JsonDocument doc;
-      doc["uid"] = uid;
-      doc["timestamp"] = (unsigned long)millis();
-      char buf[128];
-      serializeJson(doc, buf, sizeof(buf));
-      mqtt.publish(T_RFID.c_str(), buf);
-    }
-    // LCD shows waiting state briefly
-    lcd.clear();
-    lcdPrintCenter(1, "Authenticating...");
+  if (sessionActive) {
+    // Re-tap ends the session locally (fallback stop)
+    endSession("rfid");
+  } else {
+    // Ask the backend to authenticate this card
+    publishRfid(uid);
+    lcdSetState(LCD_AUTHENTICATING);
   }
 
   memcpy(lastUID, rfidReader.uid.uidByte, 4);
@@ -404,7 +420,7 @@ void handleRfid() {
 // LCD STATE MACHINE HANDLER
 // ============================================================
 void handleLcd() {
-  if (millis() - lastLcdRefresh < 500) return;
+  if (millis() - lastLcdRefresh < 400) return;
   lastLcdRefresh = millis();
 
   unsigned long elapsed = millis() - lcdStateStart;
@@ -420,136 +436,98 @@ void handleLcd() {
       break;
 
     case LCD_WIFI_CONNECT:
-      lcdPrintCenter(1, "Connecting WiFi...");
+      lcdPrintCenter(1, "Connecting to WiFi..");
+      if (WiFi.status() == WL_CONNECTED)      lcdSetState(LCD_WIFI_RESULT);
+      else if (elapsed > 15000)               lcdSetState(LCD_WIFI_RESULT);
+      break;
+
+    case LCD_WIFI_RESULT:
       if (WiFi.status() == WL_CONNECTED) {
-        lcdSetState(LCD_WIFI_STATUS);
-      } else if (elapsed > 15000) {
-        lcd.clear();
-        lcdPrintCenter(1, "WiFi: OFFLINE");
+        lcdPrintCenter(1, "WiFi Connected");
+        lcd.setCursor(0, 2);
+        lcd.print("IP:");
+        lcd.print(WiFi.localIP().toString().c_str());
+      } else {
+        lcdPrintCenter(1, "WiFi Offline");
         lcdPrintCenter(2, "Check credentials");
-        lcdStateStart = millis();
-        lcdState = LCD_WIFI_STATUS;
       }
-      break;
-
-    case LCD_WIFI_STATUS:
-      if (elapsed < 1) {
-        lcd.clear();
-        if (WiFi.status() == WL_CONNECTED) {
-          lcdPrintCenter(1, "WiFi: Connected");
-          lcd.setCursor(0, 2);
-          lcd.print("IP:");
-          lcd.print(WiFi.localIP().toString().c_str());
-        } else {
-          lcdPrintCenter(1, "WiFi: OFFLINE");
-        }
-      }
-      if (elapsed > 3000) {
-        // Check sensor health before going idle
-        if (!pzemOk || !ds18b20Ok || !rfidOk) {
-          lcdSetState(LCD_SENSOR_WARN);
-        } else {
-          lcdSetState(LCD_IDLE);
-        }
-      }
-      break;
-
-    case LCD_SENSOR_WARN:
-      lcd.setCursor(0, 0); lcd.print("! SENSOR WARNING !  ");
-      if (!pzemOk) {
-        lcd.setCursor(0, 1); lcd.print("PZEM: NOT WORKING  ");
-      } else {
-        lcd.setCursor(0, 1); lcd.print("PZEM: OK            ");
-      }
-      if (!ds18b20Ok) {
-        lcd.setCursor(0, 2); lcd.print("TEMP: NOT WORKING  ");
-      } else {
-        lcd.setCursor(0, 2); lcd.print("TEMP: OK            ");
-      }
-      if (!rfidOk) {
-        lcd.setCursor(0, 3); lcd.print("RFID: NOT WORKING  ");
-      } else {
-        lcd.setCursor(0, 3); lcd.print("RFID: OK            ");
-      }
-      if (elapsed > 5000) lcdSetState(LCD_IDLE);
+      if (elapsed > 3000) lcdSetState(LCD_IDLE);
       break;
 
     case LCD_IDLE:
       lcdPrintCenter(0, "--- 99Labs Node ---");
-      lcdPrintCenter(1, "Status: Ready");
+      lcdPrintCenter(1, mqtt.connected() ? "Status: Ready" : "MQTT: Connecting");
       lcdPrintCenter(2, "Please tap");
       lcdPrintCenter(3, "your RFID card");
-      // Show MQTT status on line 0 if not connected
-      if (!mqtt.connected()) {
-        lcd.setCursor(0, 0);
-        lcd.print("MQTT: Reconnecting..");
-      }
       break;
 
-    case LCD_AUTH_SUCCESS:
+    case LCD_AUTHENTICATING:
+      lcdPrintCenter(1, "Authenticating...");
+      lcdPrintCenter(2, "Please wait");
+      if (elapsed > AUTH_TIMEOUT_MS) lcdSetState(LCD_IDLE);
+      break;
+
+    case LCD_WELCOME:
       lcdPrintCenter(0, "*** Welcome ***");
-      snprintf(buf, sizeof(buf), "%s", sessionUserName.c_str());
+      snprintf(buf, sizeof(buf), "%s", sessionUserName.length() ? sessionUserName.c_str() : "Access Granted");
       lcdPrintCenter(1, buf);
-      lcdPrintCenter(2, "Session starting...");
+      lcdPrintCenter(2, "Session started");
       lcdPrintCenter(3, "Charging ON");
-      if (elapsed > 10000) lcdSetState(LCD_SESSION_LIVE);
+      if (elapsed > WELCOME_MS) lcdSetState(LCD_LIVE);
       break;
 
-    case LCD_AUTH_FAIL:
+    case LCD_DASHBOARD_MSG:
       lcdPrintCenter(0, "Card not registered");
       lcdPrintCenter(1, "Please open the");
       lcdPrintCenter(2, "Dashboard to create");
       lcdPrintCenter(3, "your profile");
-      if (elapsed > 10000) lcdSetState(LCD_IDLE);
+      if (elapsed > DASHBOARD_MSG_MS) lcdSetState(LCD_IDLE);
       break;
 
-    case LCD_SESSION_LIVE: {
+    case LCD_LIVE: {
       uint32_t sessSec = (millis() - sessionStartMs) / 1000;
       float consumed = sEnergy - sessionEnergyStart;
-      if (consumed < 0) consumed = 0;
+      if (consumed < 0 || isnan(consumed)) consumed = 0;
 
-      snprintf(buf, sizeof(buf), "Session: %02d:%02d:%02d",
-               sessSec / 3600, (sessSec % 3600) / 60, sessSec % 60);
-      lcd.setCursor(0, 0); lcd.print(buf);
+      snprintf(buf, sizeof(buf), "Sess:%s T:%2.0fC", fmtHMS(sessSec).c_str(), sTemperature);
+      lcd.setCursor(0, 0); lcd.print(buf); lcd.print("   ");
 
-      snprintf(buf, sizeof(buf), "V:%.1f A:%.2f T:%.1f",
-               sVoltage, sCurrent, sTemperature);
-      lcd.setCursor(0, 1); lcd.print(buf);
+      snprintf(buf, sizeof(buf), "Actv:%s", fmtHMS(getTotalTimerSec()).c_str());
+      lcd.setCursor(0, 1); lcd.print(buf); lcd.print("     ");
 
-      snprintf(buf, sizeof(buf), "Power: %.1f W       ", sPower);
-      lcd.setCursor(0, 2); lcd.print(buf);
+      snprintf(buf, sizeof(buf), "V:%5.1f I:%5.2fA", sVoltage, sCurrent);
+      lcd.setCursor(0, 2); lcd.print(buf); lcd.print("  ");
 
-      snprintf(buf, sizeof(buf), "E:%.3fkWh B:%.1f", consumed, consumed * COST_PER_UNIT);
+      snprintf(buf, sizeof(buf), "P:%4.0fW E:%6.3fkWh", sPower, consumed);
       lcd.setCursor(0, 3); lcd.print(buf);
       break;
     }
 
-    case LCD_SESSION_END: {
-      float consumed = sessionEnergyEnd - sessionEnergyStart;
-      if (consumed < 0) consumed = 0;
-
-      lcdPrintCenter(0, "== Session Summary =");
-      snprintf(buf, sizeof(buf), "Time: %02d:%02d:%02d",
-               sessionDurationSec / 3600, (sessionDurationSec % 3600) / 60,
-               sessionDurationSec % 60);
+    case LCD_SUMMARY:
+      lcdPrintCenter(0, "== SESSION SUMMARY ==");
+      snprintf(buf, sizeof(buf), "Sess:%s", fmtHMS(sessionDurationSec).c_str());
       lcd.setCursor(0, 1); lcd.print(buf);
-
-      snprintf(buf, sizeof(buf), "Energy: %.3f kWh", consumed);
+      snprintf(buf, sizeof(buf), "Actv:%s", fmtHMS(sessionSocketActiveSec).c_str());
       lcd.setCursor(0, 2); lcd.print(buf);
-
-      snprintf(buf, sizeof(buf), "Bill: Rs. %.2f", sessionBill);
+      snprintf(buf, sizeof(buf), "%6.3fkWh Rs.%.2f", sessionEnergyConsumed, sessionBill);
       lcd.setCursor(0, 3); lcd.print(buf);
-
-      if (elapsed > 30000) lcdSetState(LCD_THANKYOU);
+      if (elapsed > SUMMARY_MS) lcdSetState(LCD_THANKYOU);
       break;
-    }
 
     case LCD_THANKYOU:
       lcdPrintCenter(0, "====================");
       lcdPrintCenter(1, "Thank you for using");
-      lcdPrintCenter(2, "NinetyNine Labs!");
+      lcdPrintCenter(2, "99Labs!");
       lcdPrintCenter(3, "====================");
-      if (elapsed > 5000) lcdSetState(LCD_IDLE);
+      if (elapsed > THANKYOU_MS) lcdSetState(LCD_IDLE);
+      break;
+
+    case LCD_TEMP_FAULT:
+      lcd.setCursor(0, 0); lcd.print("!!! WARNING !!!     ");
+      lcd.setCursor(0, 1); lcd.print("OVER TEMPERATURE    ");
+      snprintf(buf, sizeof(buf), "Temp: %.1f C        ", sTemperature);
+      lcd.setCursor(0, 2); lcd.print(buf);
+      lcd.setCursor(0, 3); lcd.print("Relay Locked OFF    ");
       break;
   }
 }
@@ -570,6 +548,11 @@ void handleWifi() {
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  delay(300);
+  Serial.println("\n\n========================================");
+  Serial.println("[BOOT] SmartSocket MQTT firmware v3.0");
+  Serial.printf("[BOOT] Node ID: %s  WiFi SSID: %s\n", NODE_ID, WIFI_SSID);
+  Serial.println("========================================");
 
   // Watchdog
   esp_task_wdt_config_t wdt_config = {
@@ -586,7 +569,7 @@ void setup() {
   accumulatedSec = prefs.getUInt("timer", 0);
   prefs.end();
 
-  // Relay init
+  // Relay init (pinMode then apply state — matches known-good boot sequence)
   pinMode(RELAY_PIN, OUTPUT);
   bool physical = RELAY_ACTIVE_LOW ? !relayState : relayState;
   digitalWrite(RELAY_PIN, physical ? HIGH : LOW);
@@ -603,18 +586,27 @@ void setup() {
   }
   lcdSetState(LCD_BOOT);
 
-  // Sensors init
+  // Sensors init (PZEM + DS18B20)
   pzemSerial.begin(9600, SERIAL_8N1, PZEM_RX_PIN, PZEM_TX_PIN);
   ds18b20.begin();
   ds18b20.setWaitForConversion(false);
 
-  // RFID init
+  // RFID init (with one retry if the module does not answer)
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   rfidReader.PCD_Init();
+  delay(50);
   byte ver = rfidReader.PCD_ReadRegister(rfidReader.VersionReg);
+  if (ver == 0x00 || ver == 0xFF) {
+    delay(50);
+    rfidReader.PCD_Init();
+    delay(50);
+    ver = rfidReader.PCD_ReadRegister(rfidReader.VersionReg);
+  }
   rfidOk = (ver != 0x00 && ver != 0xFF);
+  Serial.printf("[SENSOR] RFID MFRC522 version=0x%02X -> %s\n", ver, rfidOk ? "OK" : "NOT DETECTED");
 
   // WiFi
+  Serial.printf("[WIFI] Connecting to '%s' ...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, NTP_SERVER);
@@ -636,32 +628,37 @@ void loop() {
 
   handleWifi();
 
-  // MQTT
+  static bool wifiWasConnected = false;
+  bool wifiNow = (WiFi.status() == WL_CONNECTED);
+  if (wifiNow && !wifiWasConnected) {
+    Serial.printf("[WIFI] Connected. IP=%s RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else if (!wifiNow && wifiWasConnected) {
+    Serial.println("[WIFI] Disconnected");
+  }
+  wifiWasConnected = wifiNow;
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqtt.connected()) connectMqtt();
     mqtt.loop();
   }
 
-  // Sensors
   readSensors();
 
-  // Publish telemetry every 2s
   if (millis() - lastTelemetry >= TELEMETRY_INTERVAL) {
     publishTelemetry();
     lastTelemetry = millis();
   }
 
-  // Publish heartbeat every 10s
   if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
     publishHeartbeat();
     lastHeartbeat = millis();
   }
 
-  // RFID (only in idle state or session state)
-  if (lcdState == LCD_IDLE || lcdState == LCD_SESSION_LIVE) {
+  // RFID active only when idle (tap to start) or live (re-tap to stop)
+  if (lcdState == LCD_IDLE || lcdState == LCD_LIVE) {
     handleRfid();
   }
 
-  // LCD
   handleLcd();
 }

@@ -15,7 +15,7 @@ export interface CommandLogDocument {
   commandId: string;
   nodeId: string;
   commandType: "relay_on" | "relay_off";
-  reason: "alm" | "safety" | "user" | "auth";
+  reason: "alm" | "safety" | "user" | "auth" | "auth_denied";
   timestamp: number;
   deliveryStatus: "pending" | "delivered" | "failed";
   attempts: number;

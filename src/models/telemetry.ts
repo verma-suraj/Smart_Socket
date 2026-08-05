@@ -26,7 +26,9 @@ export interface TelemetryPayload {
 export interface RelayCommand {
   relay_state: "on" | "off";
   timestamp: number;
-  reason: "alm" | "safety" | "user" | "auth";
+  reason: "alm" | "safety" | "user" | "auth" | "auth_denied";
+  /** Optional user display name, sent to the node on successful RFID auth (for the LCD). */
+  userName?: string;
 }
 
 /**
