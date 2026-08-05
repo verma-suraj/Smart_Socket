@@ -19,6 +19,7 @@
     "express": "4.21.2",
     "firebase-admin": "13.0.2",
     "mqtt": "5.10.4",
+    "smart-socket-backend": "file:",
     "ws": "8.18.0"
   },
   "devDependencies": {

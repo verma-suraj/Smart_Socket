@@ -173,16 +173,17 @@ export async function bootstrap(): Promise<{
           return;
         }
 
-        // Publish relay-on command
+        // Look up user profile for session parameters + display name
+        const userProfile = await authModule.getUserByRfid(rfidUid);
+
+        // Publish relay-on command (include the user's name for the node LCD)
         const relayOnCommand: RelayCommand = {
           relay_state: 'on',
           timestamp: Date.now(),
           reason: 'auth',
+          userName: userProfile?.name ?? '',
         };
         await mqttTransport.publishCommand(nodeId, relayOnCommand);
-
-        // Look up user profile for session parameters
-        const userProfile = await authModule.getUserByRfid(rfidUid);
 
         const batteryCapacity = userProfile?.batteryCapacity ?? 0;
         const chargerPowerRating = userProfile?.chargerPowerRating ?? 0;
@@ -217,7 +218,13 @@ export async function bootstrap(): Promise<{
 
         console.log(`[App] RFID auth success: node=${nodeId} user=${authResult.userId} priority=${priorityScore}`);
       } else {
-        // Auth failed — log the denial
+        // Auth failed — tell the node to show the "please open dashboard" hint
+        const denyCommand: RelayCommand = {
+          relay_state: 'off',
+          timestamp: Date.now(),
+          reason: 'auth_denied',
+        };
+        await mqttTransport.publishCommand(nodeId, denyCommand);
         console.log(`[App] RFID auth denied: node=${nodeId} uid=${rfidUid} error=${authResult.error}`);
       }
     } catch (error) {
@@ -231,16 +238,17 @@ export async function bootstrap(): Promise<{
   await almEngine.initialize();
   await nodeRegistry.loadFromFirestore();
 
-  // Subscribe to MQTT topics for all active nodes
-  const activeNodes = nodeRegistry.getAllActiveNodes();
-  for (const node of activeNodes) {
-    mqttTransport.subscribe(node.nodeId);
-  }
-
   // ─── 7. Connect MQTT Transport ───────────────────────────────────────────
 
   await mqttTransport.connect();
   console.log(`[App] MQTT transport connected to ${config.mqtt.brokerUrl}`);
+
+  // Subscribe to MQTT topics for all active nodes (must be AFTER connect()).
+  const activeNodes = nodeRegistry.getAllActiveNodes();
+  for (const node of activeNodes) {
+    mqttTransport.subscribe(node.nodeId);
+    console.log(`[App] Subscribed to telemetry/rfid for active node: ${node.nodeId}`);
+  }
 
   // ─── 8. Express App Setup ─────────────────────────────────────────────────
 
@@ -264,6 +272,7 @@ export async function bootstrap(): Promise<{
     authModule,
     almEngine,
     dashboardApi,
+    publishCommand: (nodeId, command) => mqttTransport.publishCommand(nodeId, command),
   });
   app.use('/api', restRouter);
 

@@ -5,6 +5,7 @@ import { IAuthModule } from '../../interfaces/auth-module.interface.js';
 import { IAlmEngine } from '../../interfaces/alm-engine.interface.js';
 import { IDashboardApi } from '../../interfaces/dashboard-api.interface.js';
 import { SessionFilters } from '../../models/session.js';
+import type { RelayCommand, DeliveryStatus } from '../../models/index.js';
 
 /**
  * Dependencies required by the REST routes.
@@ -15,6 +16,8 @@ export interface RestRouteDeps {
   authModule: IAuthModule;
   almEngine: IAlmEngine;
   dashboardApi: IDashboardApi;
+  /** Publishes a relay command to a node over MQTT. */
+  publishCommand: (nodeId: string, command: RelayCommand) => Promise<DeliveryStatus>;
 }
 
 /**
@@ -23,7 +26,7 @@ export interface RestRouteDeps {
  */
 export function createRestRoutes(deps: RestRouteDeps): Router {
   const router = Router();
-  const { nodeRegistry, sessionManager, authModule, almEngine, dashboardApi } = deps;
+  const { nodeRegistry, sessionManager, authModule, almEngine, dashboardApi, publishCommand } = deps;
 
   // ─── Node Endpoints ────────────────────────────────────────────────────────
 
@@ -186,6 +189,32 @@ export function createRestRoutes(deps: RestRouteDeps): Router {
       res.status(204).send();
     } catch (error) {
       res.status(500).json({ error: 'Failed to delete session' });
+    }
+  });
+
+  /**
+   * POST /api/nodes/:nodeId/stop
+   * Stop charging on a node: publish a relay-off command and finalize the
+   * active session (so the node LCD shows its summary screen).
+   */
+  router.post('/nodes/:nodeId/stop', async (req: Request, res: Response) => {
+    try {
+      const nodeId = req.params.nodeId as string;
+
+      await publishCommand(nodeId, {
+        relay_state: 'off',
+        timestamp: Date.now(),
+        reason: 'user',
+      });
+
+      const active = sessionManager.getActiveSession(nodeId);
+      const finalized = active
+        ? await sessionManager.finalizeSession(nodeId, 'user_ended')
+        : null;
+
+      res.json({ stopped: true, nodeId, session: finalized });
+    } catch (error) {
+      res.status(500).json({ error: 'Failed to stop charging' });
     }
   });
 
