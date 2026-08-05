@@ -231,16 +231,16 @@ export async function bootstrap(): Promise<{
   await almEngine.initialize();
   await nodeRegistry.loadFromFirestore();
 
-  // Subscribe to MQTT topics for all active nodes
-  const activeNodes = nodeRegistry.getAllActiveNodes();
-  for (const node of activeNodes) {
-    mqttTransport.subscribe(node.nodeId);
-  }
-
   // ─── 7. Connect MQTT Transport ───────────────────────────────────────────
 
   await mqttTransport.connect();
   console.log(`[App] MQTT transport connected to ${config.mqtt.brokerUrl}`);
+
+  // Subscribe to MQTT topics for all active nodes (after connection established)
+  const activeNodes = nodeRegistry.getAllActiveNodes();
+  for (const node of activeNodes) {
+    mqttTransport.subscribe(node.nodeId);
+  }
 
   // ─── 8. Express App Setup ─────────────────────────────────────────────────
 

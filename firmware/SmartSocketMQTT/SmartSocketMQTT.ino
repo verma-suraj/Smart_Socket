@@ -269,13 +269,13 @@ void publishTelemetry() {
   if (!mqtt.connected()) return;
 
   JsonDocument doc;
-  doc["voltage"]     = pzemOk ? round(sVoltage * 10.0) / 10.0 : 0;
-  doc["current"]     = pzemOk ? round(sCurrent * 100.0) / 100.0 : 0;
-  doc["power"]       = pzemOk ? round(sPower * 10.0) / 10.0 : 0;
-  doc["frequency"]   = pzemOk ? round(sFrequency * 10.0) / 10.0 : 0;
-  doc["powerFactor"] = pzemOk ? round(sPowerFactor * 100.0) / 100.0 : 0;
-  doc["temperature"] = ds18b20Ok ? round(sTemperature * 10.0) / 10.0 : 0;
-  doc["timestamp"]   = (unsigned long)millis();
+  doc["v"]  = pzemOk ? round(sVoltage * 10.0) / 10.0 : 0;
+  doc["i"]  = pzemOk ? round(sCurrent * 100.0) / 100.0 : 0;
+  doc["p"]  = pzemOk ? round(sPower * 10.0) / 10.0 : 0;
+  doc["f"]  = pzemOk ? round(sFrequency * 10.0) / 10.0 : 0;
+  doc["pf"] = pzemOk ? round(sPowerFactor * 100.0) / 100.0 : 0;
+  doc["t"]  = ds18b20Ok ? round(sTemperature * 10.0) / 10.0 : 0;
+  doc["ts"] = (unsigned long)millis();
 
   char buf[256];
   serializeJson(doc, buf, sizeof(buf));
