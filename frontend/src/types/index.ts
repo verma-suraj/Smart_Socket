@@ -115,7 +115,12 @@ export type WSMessage =
   | { type: 'telemetry'; nodeId: string; payload: TelemetryPayload }
   | { type: 'node_status'; nodeId: string; status: NodeStatus }
   | { type: 'alm_event'; event: { type: 'shedding'; nodeId: string; reason: string; timestamp: number } }
-  | { type: 'session_update'; session: Session };
+  | { type: 'session_update'; session: Session }
+  | { type: 'scan_mode_entered' }
+  | { type: 'rfid_scanned'; rfidUid: string; nodeId: string }
+  | { type: 'scan_mode_timeout' }
+  | { type: 'scan_in_progress'; error: string }
+  | { type: 'rfid_tap'; rfidUid: string; nodeId: string };
 
 // ─── UI: Notifications ───────────────────────────────────────────────────────
 

@@ -9,3 +9,18 @@
   --color-success: #10b981;
   --color-info: #3b82f6;
 }
+
+/*
+ * The app shell (NavShell) sets `text-white`, and Tailwind's preflight makes
+ * form controls `color: inherit` — so inputs without an explicit color render
+ * white-on-white (invisible text). Give form controls a legible light-field
+ * default; per-input `text-*`/`bg-*` utilities still win (utilities layer > base).
+ */
+@layer base {
+  input,
+  textarea,
+  select {
+    color: #111827;      /* gray-900 */
+    background-color: #fff;
+  }
+}

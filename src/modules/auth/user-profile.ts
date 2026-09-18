@@ -1,5 +1,6 @@
 import type { Firestore } from 'firebase-admin/firestore';
 import type { UserProfile, UserProfileInput } from '../../models/index.js';
+import { getActiveSessionsMap } from '../session-manager/session-lifecycle.js';
 
 /**
  * Manages user profile CRUD operations against Firestore.
@@ -129,6 +130,53 @@ export class UserProfileManager {
     });
 
     console.log(`[AuthModule] RFID assigned: uid="${rfidUid}" → userId=${userId}`);
+  }
+
+  /**
+   * List all user profiles from Firestore.
+   *
+   * Queries the entire `users` collection and returns all documents as UserProfile[].
+   */
+  async listAllUsers(): Promise<UserProfile[]> {
+    const snapshot = await this.firestore.collection(this.collectionName).get();
+    return snapshot.docs.map((doc) => doc.data() as UserProfile);
+  }
+
+  /**
+   * Delete a user profile by userId.
+   *
+   * Removes the user document from Firestore. Since RFID UIDs are stored
+   * within the user document's rfidUids array, deleting the document
+   * inherently frees those UIDs for re-assignment.
+   *
+   * @throws Error if the user does not exist.
+   */
+  async deleteUser(userId: string): Promise<void> {
+    const docRef = this.firestore.collection(this.collectionName).doc(userId);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      throw new Error(`User not found: userId="${userId}"`);
+    }
+
+    await docRef.delete();
+    console.log(`[AuthModule] User deleted: userId=${userId}`);
+  }
+
+  /**
+   * Check if a user has an active charging session.
+   *
+   * Iterates over the in-memory active sessions map and checks
+   * if any session's userId matches the given userId.
+   */
+  hasActiveSession(userId: string): boolean {
+    const activeSessions = getActiveSessionsMap();
+    for (const session of activeSessions.values()) {
+      if (session.userId === userId && session.active) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

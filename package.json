@@ -12,7 +12,8 @@
     "test:watch": "vitest",
     "test:property": "vitest --run tests/property",
     "test:unit": "vitest --run tests/unit",
-    "test:integration": "vitest --run tests/integration"
+    "test:integration": "vitest --run tests/integration",
+    "cleanup:test-data": "node --loader ts-node/esm -r dotenv/config scripts/cleanup-test-data.ts"
   },
   "dependencies": {
     "dotenv": "16.4.7",
@@ -25,8 +26,10 @@
   "devDependencies": {
     "@types/express": "5.0.0",
     "@types/node": "22.10.5",
+    "@types/supertest": "^7.2.1",
     "@types/ws": "8.5.13",
     "fast-check": "3.23.2",
+    "supertest": "^7.2.2",
     "ts-node": "10.9.2",
     "typescript": "5.7.3",
     "vitest": "2.1.8"

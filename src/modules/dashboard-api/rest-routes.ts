@@ -223,19 +223,20 @@ export function createRestRoutes(deps: RestRouteDeps): Router {
   /**
    * PUT /api/config/threshold
    * Update the ALM load threshold.
-   * Body: { value: number }
+   * Body: { threshold: number } (also accepts legacy { value: number })
    */
   router.put('/config/threshold', async (req: Request, res: Response) => {
     try {
-      const { value } = req.body;
+      // Accept `threshold` (frontend key); fall back to legacy `value`.
+      const raw = req.body?.threshold ?? req.body?.value;
 
-      if (value === undefined || typeof value !== 'number' || value <= 0) {
+      if (raw === undefined || typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
         res.status(400).json({ error: 'Invalid threshold value: must be a positive number' });
         return;
       }
 
-      await almEngine.setThreshold(value);
-      res.json({ threshold: value });
+      await almEngine.setThreshold(raw);
+      res.json({ threshold: raw });
     } catch (error) {
       res.status(500).json({ error: 'Failed to update threshold' });
     }
@@ -293,6 +294,65 @@ export function createRestRoutes(deps: RestRouteDeps): Router {
       res.json({ user: profile });
     } catch (error) {
       res.status(500).json({ error: 'Failed to update user profile' });
+    }
+  });
+
+  /**
+   * GET /api/users
+   * List all registered user profiles.
+   */
+  router.get('/users', async (_req: Request, res: Response) => {
+    try {
+      const profiles = await authModule.listAllUsers();
+      const users = profiles.map((p) => ({
+        userId: p.userId,
+        name: p.name,
+        evType: p.evType,
+        brand: p.brand,
+        rfidUids: p.rfidUids,
+        createdAt: p.createdAt,
+      }));
+      res.json({ users });
+    } catch (error) {
+      res.status(500).json({ error: 'Failed to retrieve users' });
+    }
+  });
+
+  /**
+   * DELETE /api/users/:userId
+   * Delete a user profile.
+   * Returns 409 if user has an active session, 404 if user not found, 204 on success.
+   */
+  router.delete('/users/:userId', async (req: Request, res: Response) => {
+    try {
+      const userId = req.params.userId as string;
+      const force = req.query.force === 'true';
+
+      if (!force && authModule.hasActiveSession(userId)) {
+        res.status(409).json({ error: 'Cannot delete user with active session' });
+        return;
+      }
+
+      if (force) {
+        // End any active session for this user and stop the physical socket(s).
+        const nodeIds = await sessionManager.forceEndUserSessions(userId);
+        for (const nodeId of nodeIds) {
+          await publishCommand(nodeId, {
+            relay_state: 'off',
+            timestamp: Date.now(),
+            reason: 'user',
+          }).catch(() => { /* best-effort: node may be offline during a force-delete */ });
+        }
+      }
+
+      await authModule.deleteUser(userId);
+      res.status(204).send();
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('User not found')) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to delete user' });
     }
   });
 

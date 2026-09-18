@@ -21,6 +21,14 @@ export class MqttTransport implements IMqttTransport {
 
   constructor(connectionManager?: MqttConnectionManager) {
     this.connectionManager = connectionManager ?? new MqttConnectionManager();
+
+    // The connection manager re-emits MQTT client errors on itself. An
+    // EventEmitter with no 'error' listener throws and crashes the process,
+    // so a routine broker hiccup (TLS/idle drop, auth wobble) would take the
+    // whole backend down. Log and let the manager's backoff reconnect handle it.
+    this.connectionManager.on('error', (err: Error) => {
+      console.error(`[MqttTransport] MQTT error: ${err.message}`);
+    });
   }
 
   /**

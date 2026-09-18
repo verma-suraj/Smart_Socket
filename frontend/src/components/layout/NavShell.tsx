@@ -23,6 +23,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'ALM Control', path: '/alm', icon: '📊', primary: false },
   { label: 'Event Log', path: '/events', icon: '📝', primary: false },
   { label: 'Guest Session', path: '/guest-session', icon: '🎫', primary: false },
+  { label: 'User Management', path: '/user-management', icon: '👥', primary: false },
 ];
 
 /** Maps route paths to breadcrumb labels */

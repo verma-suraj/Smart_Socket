@@ -1,5 +1,7 @@
 import type { Firestore } from 'firebase-admin/firestore';
 import type { AuthResult } from '../../models/index.js';
+import type { ScanModeManager } from '../scan-mode/scan-mode-manager.js';
+import type { WebSocketServer } from '../dashboard-api/websocket-server.js';
 
 /** Default RFID authentication timeout in milliseconds (3 seconds). */
 const RFID_AUTH_TIMEOUT_MS = 3000;
@@ -11,18 +13,51 @@ const RFID_AUTH_TIMEOUT_MS = 3000;
  * On success, returns the matched userId. On failure or timeout, returns an
  * access-denied result. The caller (wiring layer) is responsible for triggering
  * relay-on and session creation based on the AuthResult.
+ *
+ * When ScanModeManager and WebSocketServer are provided, incoming RFID events
+ * are first checked against scan mode. If scan mode is active, the event is
+ * intercepted and routed to the scan requester; otherwise, an rfid_tap broadcast
+ * is emitted for guest mode listeners before proceeding with normal auth.
  */
 export class RfidHandler {
-  constructor(private readonly firestore: Firestore) {}
+  constructor(
+    private readonly firestore: Firestore,
+    private readonly scanModeManager?: ScanModeManager,
+    private readonly wsServer?: WebSocketServer,
+  ) {}
 
   /**
    * Authenticate an RFID UID scanned at a specific node.
    *
+   * Before the normal auth flow, checks if scan mode is active:
+   * - If active: intercepts the event, sends rfid_scanned to the requester, and returns early.
+   * - If not active: broadcasts rfid_tap for guest mode listeners, then proceeds with auth.
+   *
    * @param nodeId - The node where the RFID was scanned.
    * @param rfidUid - The RFID UID to authenticate.
-   * @returns AuthResult indicating success or failure with response time.
+   * @returns AuthResult indicating success, failure, or interception.
    */
   async authenticate(nodeId: string, rfidUid: string): Promise<AuthResult> {
+    // ─── Scan Mode Interception ─────────────────────────────────────────────
+    if (this.scanModeManager && this.wsServer) {
+      const requesterId = this.scanModeManager.getRequesterId();
+      const scanResult = this.scanModeManager.consumeRfidEvent(rfidUid, nodeId);
+
+      if (scanResult && requesterId) {
+        // Event consumed by scan mode — route to requester and skip normal auth
+        this.wsServer.sendToClient(requesterId, {
+          type: 'rfid_scanned',
+          rfidUid: scanResult.rfidUid,
+          nodeId: scanResult.nodeId,
+        });
+        return { success: true, userId: undefined, responseTime: 0, intercepted: true };
+      }
+
+      // Not intercepted — broadcast rfid_tap for guest mode listeners
+      this.wsServer.emitRfidTap(nodeId, rfidUid);
+    }
+
+    // ─── Normal RFID Authentication Flow ────────────────────────────────────
     const startTime = Date.now();
 
     try {

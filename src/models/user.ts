@@ -6,6 +6,8 @@ export interface AuthResult {
   userId?: string;
   error?: string;
   responseTime: number;
+  /** True when the RFID event was intercepted by scan mode instead of normal auth. */
+  intercepted?: boolean;
 }
 
 /**

@@ -20,6 +20,7 @@ export function classifyTemperature(temp: number): 'normal' | 'warning' | 'criti
  * Clamp a threshold value to the range [1, 100000].
  */
 export function clampThreshold(value: number): number {
+  if (!Number.isFinite(value)) return 1;
   if (value < 1) return 1;
   if (value > 100000) return 100000;
   return value;

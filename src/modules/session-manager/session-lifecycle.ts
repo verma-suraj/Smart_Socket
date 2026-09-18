@@ -60,6 +60,7 @@ export function createSession(params: CreateSessionParams): Session {
     endReason: null,
     active: true,
     guestSpecs: params.guestSpecs ?? null,
+    rfidUid: params.rfidUid ?? null,
   };
 
   activeSessions.set(params.nodeId, session);

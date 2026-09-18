@@ -15,12 +15,16 @@ import type { WSMessage } from '../types';
 
 type ConnectionStatus = 'connected' | 'disconnected' | 'reconnecting';
 type MessageHandler = (message: WSMessage) => void;
+type RawMessageHandler = (message: Record<string, unknown>) => void;
+type DisconnectHandler = () => void;
 
 class WebSocketService {
   private ws: WebSocket | null = null;
   private url: string = '';
   private status: ConnectionStatus = 'disconnected';
   private messageHandlers: MessageHandler[] = [];
+  private rawMessageHandlers: RawMessageHandler[] = [];
+  private disconnectHandlers: DisconnectHandler[] = [];
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -71,6 +75,51 @@ class WebSocketService {
   }
 
   /**
+   * Send a JSON-serializable message through the WebSocket connection.
+   * Returns true if the message was sent, false if not connected.
+   */
+  send(data: Record<string, unknown>): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      this.ws.send(JSON.stringify(data));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Register a handler for raw parsed JSON messages (before type-based routing).
+   * Useful for receiving message types not handled by the default router.
+   */
+  onRawMessage(handler: RawMessageHandler): void {
+    this.rawMessageHandlers.push(handler);
+  }
+
+  /**
+   * Unregister a raw message handler.
+   */
+  offRawMessage(handler: RawMessageHandler): void {
+    this.rawMessageHandlers = this.rawMessageHandlers.filter((h) => h !== handler);
+  }
+
+  /**
+   * Register a handler that fires when the WebSocket connection is lost unexpectedly.
+   */
+  onDisconnect(handler: DisconnectHandler): void {
+    this.disconnectHandlers.push(handler);
+  }
+
+  /**
+   * Unregister a disconnect handler.
+   */
+  offDisconnect(handler: DisconnectHandler): void {
+    this.disconnectHandlers = this.disconnectHandlers.filter((h) => h !== handler);
+  }
+
+  /**
    * Create the WebSocket connection and attach event handlers.
    */
   private createConnection(): void {
@@ -111,6 +160,24 @@ class WebSocketService {
       return;
     }
 
+    // Try to parse as JSON first for raw handlers
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      const result = JSON.parse(data);
+      if (result !== null && typeof result === 'object') {
+        parsed = result as Record<string, unknown>;
+      }
+    } catch {
+      // Not valid JSON — skip raw handlers
+    }
+
+    // Dispatch to raw message handlers (all message types)
+    if (parsed) {
+      for (const handler of this.rawMessageHandlers) {
+        handler(parsed);
+      }
+    }
+
     const handlers = {
       telemetry: (msg: unknown) => this.dispatchToHandlers(msg as WSMessage),
       node_status: (msg: unknown) => this.dispatchToHandlers(msg as WSMessage),
@@ -137,6 +204,11 @@ class WebSocketService {
   private handleConnectionFailure(): void {
     if (this.intentionalDisconnect) {
       return;
+    }
+
+    // Notify disconnect handlers
+    for (const handler of this.disconnectHandlers) {
+      handler();
     }
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
@@ -169,4 +241,4 @@ class WebSocketService {
 
 /** Singleton instance of the WebSocket service. */
 export const webSocketService = new WebSocketService();
-export type { ConnectionStatus, MessageHandler };
+export type { ConnectionStatus, MessageHandler, RawMessageHandler, DisconnectHandler };

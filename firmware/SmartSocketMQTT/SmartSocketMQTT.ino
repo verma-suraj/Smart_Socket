@@ -112,6 +112,8 @@ enum LcdState {
 LcdState lcdState = LCD_BOOT;
 unsigned long lcdStateStart = 0;
 String sessionUserName = "";
+char sessionOwnerUID[12] = "";   // UID of the card that started the session (only it may end it)
+char pendingUID[12] = "";        // UID last sent for auth; becomes the owner when the session starts
 
 // ============================================================
 // STATE VARIABLES
@@ -212,6 +214,9 @@ void startSession(const char* userName) {
   sessionEnergyStart = sEnergy;
   sessionStartMs = millis();
   sessionUserName = String(userName);
+  // The card that just authenticated owns this session — remember it so only it can stop charging.
+  strncpy(sessionOwnerUID, pendingUID, sizeof(sessionOwnerUID));
+  sessionOwnerUID[sizeof(sessionOwnerUID) - 1] = '\0';
   setRelay(true);
   lcdSetState(LCD_WELCOME);
   Serial.printf("[SESSION] Started user='%s'\n", sessionUserName.c_str());
@@ -402,10 +407,25 @@ void handleRfid() {
            rfidReader.uid.uidByte[2], rfidReader.uid.uidByte[3]);
 
   if (sessionActive) {
-    // Re-tap ends the session locally (fallback stop)
-    endSession("rfid");
+    // Only the exact card that started the session may end it.
+    if (sessionOwnerUID[0] != '\0' && strcmp(uid, sessionOwnerUID) == 0) {
+      // Same card -> end the local session immediately for responsive UX.
+      endSession("rfid");
+    } else if (sessionOwnerUID[0] == '\0') {
+      // Owner unknown (session started remotely with no local tap). Do NOT let
+      // an arbitrary card end it locally — forward to the backend, which is the
+      // authority on whether this UID owns the active session.
+      strncpy(pendingUID, uid, sizeof(pendingUID));
+      pendingUID[sizeof(pendingUID) - 1] = '\0';
+      publishRfid(uid);
+      Serial.printf("[RFID] Active session owner unknown; deferring end decision to backend for card %s\n", uid);
+    } else {
+      Serial.printf("[RFID] End denied: card %s is not the session owner %s\n", uid, sessionOwnerUID);
+    }
   } else {
-    // Ask the backend to authenticate this card
+    // Ask the backend to authenticate this card (this UID becomes the owner if approved)
+    strncpy(pendingUID, uid, sizeof(pendingUID));
+    pendingUID[sizeof(pendingUID) - 1] = '\0';
     publishRfid(uid);
     lcdSetState(LCD_AUTHENTICATING);
   }

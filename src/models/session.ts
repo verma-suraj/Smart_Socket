@@ -33,6 +33,12 @@ export interface Session {
   endReason: SessionEndReason | null;
   active: boolean;
   guestSpecs: GuestSpecs | null;
+  /**
+   * The RFID UID of the card that started this session. Only this card may
+   * end the session via a tap. Null for sessions started without an RFID tap
+   * (e.g. guest sessions started from the dashboard).
+   */
+  rfidUid: string | null;
 }
 
 /**

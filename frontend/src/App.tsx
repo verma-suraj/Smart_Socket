@@ -15,6 +15,7 @@ import NodeManagementPage from './pages/NodeManagementPage';
 import ALMControlPage from './pages/ALMControlPage';
 import EventLogPage from './pages/EventLogPage';
 import GuestSessionPage from './pages/GuestSessionPage';
+import UserManagementPage from './pages/UserManagementPage';
 
 function App() {
   const setUser = useAuthStore((state) => state.setUser);
@@ -59,6 +60,7 @@ function App() {
             <Route path="/alm" element={<ALMControlPage />} />
             <Route path="/events" element={<EventLogPage />} />
             <Route path="/guest-session" element={<GuestSessionPage />} />
+            <Route path="/user-management" element={<UserManagementPage />} />
           </Route>
         </Route>
       </Routes>

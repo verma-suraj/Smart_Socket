@@ -6,6 +6,7 @@ import { useAuthStore } from '../stores/auth.store';
 import { useUIStore } from '../stores/ui.store';
 import { createUser, updateUser } from '../services/api.service';
 import { computeProfileDiff } from '../utils/filters';
+import { RfidScanButton } from '../components/RfidScanButton';
 import type { UserProfileInput } from '../types';
 
 /**
@@ -79,6 +80,7 @@ export default function UserProfilePage() {
     control,
     handleSubmit,
     reset,
+    setValue,
     formState: { errors, isValid },
   } = useForm<UserProfileFormValues>({
     resolver: zodResolver(userProfileSchema),
@@ -340,28 +342,49 @@ export default function UserProfilePage() {
           )}
         </div>
 
-        {/* RFID UIDs - Dynamic List */}
+        {/* RFID UIDs - Dynamic List with Tap-to-Capture */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
             RFID UIDs (max 5)
           </label>
-          <div className="space-y-2">
+          <p className="text-xs text-gray-500 mb-2">
+            Tap your RFID card on a reader to auto-capture, or type the UID manually.
+          </p>
+          <div className="space-y-3">
             {fields.map((field, index) => (
-              <div key={field.id} className="flex gap-2">
-                <input
-                  type="text"
-                  className="flex-1 border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder={`RFID UID ${index + 1}`}
-                  {...register(`rfidUids.${index}.value`)}
+              <div key={field.id} className="flex flex-col gap-2 p-3 border border-gray-200 rounded-lg bg-gray-50">
+                <div className="flex gap-2 items-start">
+                  <input
+                    type="text"
+                    className="flex-1 border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder={`RFID UID ${index + 1}`}
+                    aria-label={`RFID UID ${index + 1}`}
+                    {...register(`rfidUids.${index}.value`)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => remove(index)}
+                    className="px-3 py-2 bg-red-100 text-red-700 rounded-md hover:bg-red-200 transition-colors"
+                    aria-label={`Remove RFID UID ${index + 1}`}
+                  >
+                    Remove
+                  </button>
+                </div>
+                <RfidScanButton
+                  onUidCaptured={(uid: string) => {
+                    // Populate the corresponding text input with the captured UID
+                    setValue(`rfidUids.${index}.value`, uid, { shouldValidate: true, shouldDirty: true });
+                  }}
+                  onError={(message: string) => {
+                    addNotification({
+                      type: 'error',
+                      title: 'RFID Scan Error',
+                      message,
+                      autoDismiss: true,
+                      autoDismissMs: 5000,
+                    });
+                  }}
                 />
-                <button
-                  type="button"
-                  onClick={() => remove(index)}
-                  className="px-3 py-2 bg-red-100 text-red-700 rounded-md hover:bg-red-200 transition-colors"
-                  aria-label={`Remove RFID UID ${index + 1}`}
-                >
-                  Remove
-                </button>
               </div>
             ))}
             {errors.rfidUids && typeof errors.rfidUids === 'object' && 'message' in errors.rfidUids && (
@@ -376,13 +399,34 @@ export default function UserProfilePage() {
             ))}
           </div>
           {fields.length < 5 && (
-            <button
-              type="button"
-              onClick={() => append({ value: '' })}
-              className="mt-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 transition-colors text-sm"
-            >
-              + Add RFID UID
-            </button>
+            <div className="mt-3 flex flex-col gap-2 p-3 border border-dashed border-gray-300 rounded-lg">
+              <button
+                type="button"
+                onClick={() => append({ value: '' })}
+                className="px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 transition-colors text-sm"
+              >
+                + Add RFID UID
+              </button>
+              <div className="flex items-center gap-2 text-xs text-gray-500">
+                <span>or scan to add:</span>
+                <RfidScanButton
+                  onUidCaptured={(uid: string) => {
+                    // Add a new RFID UID entry with the captured value
+                    append({ value: uid });
+                  }}
+                  onError={(message: string) => {
+                    addNotification({
+                      type: 'error',
+                      title: 'RFID Scan Error',
+                      message,
+                      autoDismiss: true,
+                      autoDismissMs: 5000,
+                    });
+                  }}
+                  disabled={fields.length >= 5}
+                />
+              </div>
+            </div>
           )}
         </div>
 

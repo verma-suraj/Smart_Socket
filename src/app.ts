@@ -18,8 +18,12 @@ import {
   createRestRoutes,
   firebaseAuthMiddleware,
 } from './modules/dashboard-api/index.js';
+import { ScanModeManager } from './modules/scan-mode/scan-mode-manager.js';
+import { wireScanModeWebSocket } from './modules/scan-mode/scan-mode-ws-handler.js';
+import { createCommandLogger } from './modules/command-log/index.js';
+import { logger } from './modules/logger/index.js';
 
-import type { TelemetryPayload, RelayCommand } from './models/index.js';
+import type { TelemetryPayload, RelayCommand, DeliveryStatus } from './models/index.js';
 
 /**
  * Application bootstrap — initializes all modules, wires event handlers,
@@ -56,8 +60,17 @@ export async function bootstrap(): Promise<{
   const temperatureMonitor = new TemperatureMonitor(firestore);
   const almEngine = new AlmEngine(firestore, temperatureMonitor);
   const priorityCalculator = new PriorityCalculator();
-  const sessionManager = new SessionManager();
-  const authModule = new AuthModule(firestore);
+  const sessionManager = new SessionManager(firestore);
+  const commandLogger = createCommandLogger(firestore);
+  const scanModeManager = new ScanModeManager();
+
+  // WebSocketServer is instantiated below; AuthModule receives it via options
+  const wsServer = new WebSocketServer();
+
+  const authModule = new AuthModule(firestore, {
+    scanModeManager,
+    wsServer,
+  });
 
   const nodeRegistry = new NodeRegistry(firestore, {
     onRegister: (nodeId: string) => {
@@ -71,14 +84,43 @@ export async function bootstrap(): Promise<{
     },
   });
 
-  const wsServer = new WebSocketServer();
-
   const dashboardApi = new DashboardApi({
     nodeRegistry,
     sessionManager,
     almEngine,
     wsServer,
   });
+
+  // ─── 3a. Command publish + logging wrapper ────────────────────────────────
+  // Single choke point for all relay commands so every command is persisted to
+  // the Firestore `commandLog` collection (fire-and-forget) and logged.
+  const publishAndLog = async (nodeId: string, command: RelayCommand): Promise<DeliveryStatus> => {
+    let deliveryStatus: DeliveryStatus;
+    try {
+      deliveryStatus = await mqttTransport.publishCommand(nodeId, command);
+    } catch (error) {
+      logger.error('App', 'Relay command publish failed', {
+        nodeId,
+        relayState: command.relay_state,
+        reason: command.reason,
+        error,
+      });
+      // Record the failed attempt so it is still visible in the command log.
+      const failed: DeliveryStatus = { delivered: false, attempts: 0, timestamp: Date.now() };
+      commandLogger.logCommand(nodeId, command, failed);
+      throw error;
+    }
+
+    commandLogger.logCommand(nodeId, command, deliveryStatus);
+    logger.info('App', 'Relay command published', {
+      nodeId,
+      relayState: command.relay_state,
+      reason: command.reason,
+      delivered: deliveryStatus.delivered,
+      attempts: deliveryStatus.attempts,
+    });
+    return deliveryStatus;
+  };
 
   // ─── 3. Telemetry Timestamps (for energy delta calculations) ──────────────
 
@@ -98,7 +140,7 @@ export async function bootstrap(): Promise<{
           timestamp: Date.now(),
           reason: 'safety',
         };
-        await mqttTransport.publishCommand(nodeId, shutdownCommand);
+        await publishAndLog(nodeId, shutdownCommand);
 
         // Finalize the active session if one exists
         const activeSession = sessionManager.getActiveSession(nodeId);
@@ -120,7 +162,7 @@ export async function bootstrap(): Promise<{
           timestamp: Date.now(),
           reason: 'alm',
         };
-        await mqttTransport.publishCommand(shed.nodeId, shedCommand);
+        await publishAndLog(shed.nodeId, shedCommand);
 
         // Finalize the shed session
         const shedSession = sessionManager.getActiveSession(shed.nodeId);
@@ -163,8 +205,43 @@ export async function bootstrap(): Promise<{
 
   mqttTransport.onRfidScan(async (nodeId: string, rfidUid: string) => {
     try {
-      // (1) Authenticate the RFID UID
+      // (1) Authenticate the RFID UID (scan mode interception happens inside RfidHandler)
       const authResult = await authModule.authenticateRfid(nodeId, rfidUid);
+
+      // If the event was intercepted by scan mode, skip normal auth flow
+      if (authResult.intercepted) {
+        console.log(`[App] RFID event intercepted by scan mode: node=${nodeId} uid=${rfidUid}`);
+        return;
+      }
+
+      // ─── Same-card logout enforcement ─────────────────────────────────────
+      // If a session is already active on this node, a tap must ONLY be honored
+      // when it comes from the exact card that started the session. Any other
+      // card is rejected (no login, no logout).
+      const existingSession = sessionManager.getActiveSession(nodeId);
+      if (existingSession) {
+        if (existingSession.rfidUid && existingSession.rfidUid === rfidUid) {
+          // Same card tapped again → end the session (logout).
+          await sessionManager.finalizeSession(nodeId, 'user_ended');
+          almEngine.removeNodePriority(nodeId);
+
+          const relayOffCommand: RelayCommand = {
+            relay_state: 'off',
+            timestamp: Date.now(),
+            reason: 'user',
+          };
+          await publishAndLog(nodeId, relayOffCommand);
+
+          logger.info('App', 'RFID logout: session ended by owning card', { nodeId, rfidUid });
+        } else {
+          // A different card (or an ownerless session) — reject the tap.
+          console.warn(
+            `[App] RFID logout denied: node=${nodeId} uid=${rfidUid} does not own the active session ` +
+            `(owner=${existingSession.rfidUid ?? 'unknown'})`
+          );
+        }
+        return;
+      }
 
       if (authResult.success && authResult.userId) {
         // Check temperature override before activating
@@ -183,7 +260,7 @@ export async function bootstrap(): Promise<{
           reason: 'auth',
           userName: userProfile?.name ?? '',
         };
-        await mqttTransport.publishCommand(nodeId, relayOnCommand);
+        await publishAndLog(nodeId, relayOnCommand);
 
         const batteryCapacity = userProfile?.batteryCapacity ?? 0;
         const chargerPowerRating = userProfile?.chargerPowerRating ?? 0;
@@ -198,6 +275,7 @@ export async function bootstrap(): Promise<{
           chargerPowerRating,
           initialSOC,
           guestSpecs: null,
+          rfidUid,
         });
 
         // Calculate and set priority for ALM
@@ -216,7 +294,12 @@ export async function bootstrap(): Promise<{
         // Emit session update to dashboard
         dashboardApi.emitSessionUpdate(session);
 
-        console.log(`[App] RFID auth success: node=${nodeId} user=${authResult.userId} priority=${priorityScore}`);
+        logger.info('App', 'RFID auth success: session started', {
+          nodeId,
+          userId: authResult.userId,
+          rfidUid,
+          priorityScore,
+        });
       } else {
         // Auth failed — tell the node to show the "please open dashboard" hint
         const denyCommand: RelayCommand = {
@@ -224,8 +307,8 @@ export async function bootstrap(): Promise<{
           timestamp: Date.now(),
           reason: 'auth_denied',
         };
-        await mqttTransport.publishCommand(nodeId, denyCommand);
-        console.log(`[App] RFID auth denied: node=${nodeId} uid=${rfidUid} error=${authResult.error}`);
+        await publishAndLog(nodeId, denyCommand);
+        logger.warn('App', 'RFID auth denied', { nodeId, rfidUid, error: authResult.error });
       }
     } catch (error) {
       console.error(`[App] Error processing RFID scan for node=${nodeId}:`, error);
@@ -272,7 +355,7 @@ export async function bootstrap(): Promise<{
     authModule,
     almEngine,
     dashboardApi,
-    publishCommand: (nodeId, command) => mqttTransport.publishCommand(nodeId, command),
+    publishCommand: (nodeId, command) => publishAndLog(nodeId, command),
   });
   app.use('/api', restRouter);
 
@@ -280,6 +363,9 @@ export async function bootstrap(): Promise<{
 
   const httpServer = createServer(app);
   wsServer.attach(httpServer);
+
+  // Wire scan mode WebSocket handlers (must be after wsServer.attach)
+  wireScanModeWebSocket(scanModeManager, wsServer);
 
   await new Promise<void>((resolve) => {
     httpServer.listen(config.server.port, config.server.host, () => {

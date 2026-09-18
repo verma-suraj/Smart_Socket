@@ -1,8 +1,18 @@
 import type { Firestore } from 'firebase-admin/firestore';
 import type { IAuthModule } from '../../interfaces/auth-module.interface.js';
 import type { AuthResult, UserProfile, UserProfileInput } from '../../models/index.js';
+import type { ScanModeManager } from '../scan-mode/scan-mode-manager.js';
+import type { WebSocketServer } from '../dashboard-api/websocket-server.js';
 import { RfidHandler } from './rfid-handler.js';
 import { UserProfileManager } from './user-profile.js';
+
+/**
+ * Options for configuring the AuthModule with optional scan mode integration.
+ */
+export interface AuthModuleOptions {
+  scanModeManager?: ScanModeManager;
+  wsServer?: WebSocketServer;
+}
 
 /**
  * Auth Module — composes RFID authentication and user profile management.
@@ -18,8 +28,12 @@ export class AuthModule implements IAuthModule {
   private readonly rfidHandler: RfidHandler;
   private readonly userProfileManager: UserProfileManager;
 
-  constructor(firestore: Firestore) {
-    this.rfidHandler = new RfidHandler(firestore);
+  constructor(firestore: Firestore, options?: AuthModuleOptions) {
+    this.rfidHandler = new RfidHandler(
+      firestore,
+      options?.scanModeManager,
+      options?.wsServer,
+    );
     this.userProfileManager = new UserProfileManager(firestore);
   }
 
@@ -69,6 +83,29 @@ export class AuthModule implements IAuthModule {
    */
   async assignRfid(userId: string, rfidUid: string): Promise<void> {
     return this.userProfileManager.assignRfid(userId, rfidUid);
+  }
+
+  /**
+   * List all registered user profiles.
+   */
+  async listAllUsers(): Promise<UserProfile[]> {
+    return this.userProfileManager.listAllUsers();
+  }
+
+  /**
+   * Delete a user profile and free associated RFID UIDs.
+   *
+   * @throws Error if the user does not exist.
+   */
+  async deleteUser(userId: string): Promise<void> {
+    return this.userProfileManager.deleteUser(userId);
+  }
+
+  /**
+   * Check if a user has an active charging session.
+   */
+  hasActiveSession(userId: string): boolean {
+    return this.userProfileManager.hasActiveSession(userId);
   }
 }
 

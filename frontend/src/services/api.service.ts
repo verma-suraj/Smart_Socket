@@ -247,6 +247,22 @@ export async function updateThreshold(value: number): Promise<{ threshold: numbe
 // ─── Users ───────────────────────────────────────────────────────────────────
 
 /**
+ * Fetch all registered user profiles.
+ */
+export async function getUsers(): Promise<UserProfile[]> {
+  const response = await api.get<{ users: UserProfile[] }>('/users');
+  return response.data.users;
+}
+
+/**
+ * Delete a user profile by ID.
+ * Pass force=true to end any active session and delete anyway (admin override).
+ */
+export async function deleteUser(userId: string, force = false): Promise<void> {
+  await api.delete(`/users/${userId}`, force ? { params: { force: 'true' } } : undefined);
+}
+
+/**
  * Create a new user profile.
  */
 export async function createUser(profile: UserProfileInput): Promise<UserProfile> {

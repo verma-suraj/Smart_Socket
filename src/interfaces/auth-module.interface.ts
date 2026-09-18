@@ -6,4 +6,7 @@ export interface IAuthModule {
   updateUser(userId: string, updates: Partial<UserProfileInput>): Promise<UserProfile>;
   getUserByRfid(rfidUid: string): Promise<UserProfile | null>;
   assignRfid(userId: string, rfidUid: string): Promise<void>;
+  listAllUsers(): Promise<UserProfile[]>;
+  deleteUser(userId: string): Promise<void>;
+  hasActiveSession(userId: string): boolean;
 }
